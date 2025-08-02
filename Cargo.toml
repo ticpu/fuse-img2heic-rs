@@ -1,0 +1,29 @@
+[package]
+name = "fuse-img2heic-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jerome <jerome@example.com>"]
+description = "FUSE filesystem that transparently converts images to HEIC format for bandwidth optimization"
+license = "MIT"
+
+[dependencies]
+fuser = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+regex = "1.10"
+libheif-rs = "0.22"
+image = "0.24"
+infer = "0.15"
+walkdir = "2.4"
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
+clap = { version = "4.4", features = ["derive"] }
+num_cpus = "1.16"
+crossbeam = "0.8"
+parking_lot = "0.12"
+dashmap = "5.5"
+ctrlc = "3.4"
+libc = "0.2"
+tempfile = "3.20.0"

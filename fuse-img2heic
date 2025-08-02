@@ -1,0 +1,24 @@
+#!/bin/sh
+# Wrapper script to run the most recently built binary
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RELEASE_BIN="$SCRIPT_DIR/target/release/fuse-img2heic-rs"
+DEBUG_BIN="$SCRIPT_DIR/target/debug/fuse-img2heic-rs"
+
+if [ -f "$RELEASE_BIN" ] && [ -f "$DEBUG_BIN" ]; then
+    if [ "$RELEASE_BIN" -nt "$DEBUG_BIN" ]; then
+        exec "$RELEASE_BIN" "$@"
+    else
+        exec "$DEBUG_BIN" "$@"
+    fi
+elif [ -f "$RELEASE_BIN" ]; then
+    exec "$RELEASE_BIN" "$@"
+elif [ -f "$DEBUG_BIN" ]; then
+    exec "$DEBUG_BIN" "$@"
+else
+    cargo build --release || {
+		echo "Failed to build $RELEASE_BIN"
+		exit 1
+	}
+	exec "$RELEASE_BIN" "$@"
+fi

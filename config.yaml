@@ -1,0 +1,54 @@
+# FUSE Image Converter Configuration
+# This config will be automatically copied to ~/.config/fuse-img2heic-rs/config.yaml if not found
+
+# Mount point for the FUSE filesystem
+mount_point: "/tmp/fuse-img2heic"
+
+# Source paths to scan for images
+source_paths:
+  # Recursive scan of Pictures directory
+  - path: "~/Pictures"
+    recursive: true
+
+  # Non-recursive scan of Downloads (for quick access to recent downloads)
+  - path: "~/Downloads"
+    recursive: false
+
+  # Add more paths as needed
+  # - path: "/media/photos"
+  #   recursive: true
+
+# Filename patterns to match (regex)
+filename_patterns:
+  - ".*\\.(jpg|jpeg|png|gif|heic|webp|bmp|tiff)$"
+
+# HEIC conversion settings
+heic_settings:
+  # Quality: 1-100 (higher = better quality, larger file size)
+  # Recommended: 40-60 for good compression, 70-85 for high quality
+  quality: 40
+
+  # Speed: 1-10 (higher = faster encoding, may reduce compression efficiency)
+  # Recommended: 4-6 for balanced speed/compression
+  speed: 4
+
+  # Chroma subsampling: 420, 422, or 444
+  # 420 = best compression (recommended for photos)
+  # 422 = balanced
+  # 444 = no chroma subsampling (larger files)
+  chroma: 420
+
+# Cache settings
+cache:
+  # Maximum cache size in MB (converted images are cached for faster access)
+  # Set to 0 to disable memory caching (not recommended)
+  max_size_mb: 1024
+
+  # Custom cache directory (optional)
+  # If not specified, uses ~/.cache/fuse-img2heic-rs
+  # cache_dir: "/custom/cache/path"
+
+# Logging configuration
+logging:
+  # Log level: error, warn, info, debug, trace
+  level: "info"
