@@ -63,6 +63,14 @@ impl HeicSettings {
 pub struct CacheSettings {
     pub max_size_mb: u64,
     pub cache_dir: Option<PathBuf>,
+    /// Enable cache file encryption using the source filepath as the encryption key
+    /// Default: true for security
+    #[serde(default = "default_encryption")]
+    pub enable_encryption: bool,
+}
+
+fn default_encryption() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +124,8 @@ impl Default for Config {
             },
             cache: CacheSettings {
                 max_size_mb: 1024,
-                cache_dir: None, // Will use default XDG cache dir
+                cache_dir: None,         // Will use default XDG cache dir
+                enable_encryption: true, // Enable by default
             },
             logging: LoggingSettings {
                 level: "warn".to_string(),

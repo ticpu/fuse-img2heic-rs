@@ -1,85 +1,126 @@
-# FUSE Image Converter - Project Documentation
+# FUSE Image to HEIC Converter - Architecture Documentation
 
-## Project Goals
-
-**Problem**: Remote photo browsing consumes excessive bandwidth when downloading large images (7MB+) through apps like SolidExplorer.
-
-**Solution**: A FUSE filesystem that transparently converts images to compressed HEIC format on-the-fly, reducing bandwidth usage by 70-90% without requiring client-side changes.
-
-## Architecture Overview
+## System Architecture
 
 ### Core Components
 
-- **`main.rs`**: CLI application with XDG-compliant paths (`~/.config`, `~/.cache`) and systemd --user service compatibility
-- **`config.rs`**: YAML configuration system with quality settings, source paths, and cache management
-- **`filesystem.rs`**: FUSE operations (lookup, getattr, read, readdir) creating virtual .heic files from source images
-- **`image_converter.rs`**: Real HEIC encoding using libheif-rs with HEVC compression and configurable quality
-- **`cache.rs`**: ATime-based LRU cache with disk persistence for converted images
-- **`thread_pool.rs`**: Multi-threaded conversion utilizing all CPU cores
-- **`file_detector.rs`**: Content-based image format detection with regex filename filtering
+**`main.rs`** - CLI entry point with XDG-compliant paths and systemd compatibility
+**`config.rs`** - YAML configuration system with structured settings
+**`filesystem.rs`** - FUSE operations implementation (lookup, getattr, read, readdir)
+**`image_converter.rs`** - HEIC encoding/decoding using libheif-rs
+**`cache.rs`** - SHA256-based LRU cache with disk persistence
+**`thread_pool.rs`** - Multi-threaded conversion pipeline
+**`file_detector.rs`** - Content-based image format detection and virtual path mapping
+**`mount_management.rs`** - Mount point management and signal handling
 
 ### Data Flow
 
-1. **Discovery**: Scans configured source paths for images (`~/Pictures`, etc.)
-2. **Virtual Mapping**: Presents images as `.heic` files in mount point
-3. **On-Demand Conversion**: 
-   - Cache check → Convert (if miss) → Cache result → Serve
-   - Blocks read operations until conversion complete
-4. **Caching**: Stores converted images with key format `{full_path}#{target_size}`
+```
+Directory Listing Request
+├─ file_detector.rs: list_virtual_directory_with_exclusions()
+├─ Virtual path mapping with mount_name organization
+└─ Return .heic filenames for all images
 
-## Key Features
-
-- **Transparent Operation**: Works with existing apps without modification
-- **Bandwidth Optimization**: 70-90% compression vs original images
-- **Performance**: Sub-millisecond cache hits, multi-threaded conversion
-- **User Integration**: XDG Base Directory compliance, systemd service ready
-- **Smart Caching**: Persistent across restarts, automatic LRU eviction
-
-## Configuration
-
-**Default Config**: `~/.config/fuse-img2heic-rs/config.yaml`
-```yaml
-source_paths:
-  - path: "~/Pictures"
-    recursive: true
-
-heic_settings:
-  quality: 50    # 1-100, lower = more compression
-  speed: 4       # 1-10, higher = faster encoding
-  chroma: 420    # 420/422/444
-
-cache:
-  max_size_mb: 1024
+File Read Request
+├─ filesystem.rs: lookup() → get_real_path()
+├─ cache.rs: Check SHA256(filepath + filesize) key
+├─ Cache miss: thread_pool.rs → image_converter.rs
+├─ HEIC conversion with quality/resolution settings
+├─ cache.rs: Store in .cache/xx/xxxxx structure
+└─ Return converted data
 ```
 
-## Usage
+### Virtual Filesystem Structure
 
-```bash
-# Initial setup
-fuse-img2heic setup
-
-# Run with default mount point from config
-fuse-img2heic
-
-# Override mount point
-fuse-img2heic -m /mnt/images
-
-# Run in foreground for debugging
-fuse-img2heic -f
-
-# Systemd user service
-systemctl --user enable fuse-img2heic.service
+Source paths are mapped to virtual hierarchy via `mount_name`:
+```
+Real: ~/Pictures/vacation.jpg + ~/DCIM/photo.png
+Virtual: /mount/pictures/vacation.heic + /mount/camera/photo.heic
 ```
 
-## Technical Notes
+## Code Organization
 
-- **Cache Location**: `~/.cache/fuse-img2heic-rs/`
-- **Supported Formats**: JPEG, PNG, GIF, WebP, BMP, TIFF → HEIC
-- **Dependencies**: libheif-rs for HEVC encoding, fuser for FUSE operations
-- **Thread Safety**: DashMap for concurrent cache access, crossbeam channels for job distribution
+### Configuration Structure
+```rust
+struct Config {
+    source_paths: Vec<SourcePath>,  // Real directories to scan
+    heic_settings: HeicSettings,    // Compression parameters
+    cache: CacheSettings,           // Size limits and paths
+    fuse: FuseSettings,             // Filesystem caching
+}
+```
 
-This project solves remote bandwidth limitations while maintaining transparent file access through the standard filesystem interface.
+### FUSE Implementation Pattern
+- **Lazy evaluation**: No eager directory scanning
+- **Inode management**: HashMap-based virtual path tracking
+- **Error handling**: Proper FUSE error codes (ENOENT, EINVAL, EIO)
 
-## Development Memories
+### Cache Architecture
+```rust
+Key: SHA256(filepath + original_filesize)
+Storage: ~/.cache/fuse-img2heic-rs/{first_2_hex_chars}/{remaining_hex}
+Eviction: ATime-based LRU with configurable size limits
+```
 
-- Hard coding is bad, instead, add a configuration option in the YAML
+### Thread Safety
+- `DashMap` for concurrent cache access
+- `crossbeam` channels for job distribution
+- Thread pool blocks on conversion completion
+- No shared mutable state in FUSE operations
+
+## Critical Implementation Notes
+
+### HEIC Decoding Requirements
+- libheif-rs API requires specific color space handling
+- HEIC-to-HEIC recompression needs `decode_heic_with_libheif()`
+- Interleaved RGB plane extraction with stride handling
+- Must handle both existing HEIC and other formats
+
+### Path Resolution Logic
+```rust
+// Virtual path: "mount_name/subpath/file.heic" 
+// Real path: source_path.path/subpath/file.{jpg,png,heic,...}
+```
+
+### Mount Point Exclusion
+Critical: Exclude mount point from directory listings to prevent infinite recursion when source path contains mount point.
+
+### Error Handling Strategy
+- Fallback to original file if conversion fails
+- Cache original data on conversion errors
+- Log conversion failures but continue serving
+
+## Dependencies and Requirements
+
+### System Dependencies
+- `libheif-dev` - HEIC encoding/decoding library
+- `libfuse3-dev` - FUSE filesystem interface
+
+### Rust Dependencies
+- `fuser` - FUSE bindings for Rust
+- `libheif-rs` - Safe libheif wrapper
+- `image` - Image format handling and basic conversions
+- `serde_yaml` - Configuration file parsing
+- `dashmap` - Concurrent HashMap
+- `crossbeam` - Threading primitives
+- `sha2` + `hex` - Cache key generation
+- `anyhow` - Error handling
+- `clap` - CLI argument parsing
+
+## Coding Practices
+
+### Logging Levels
+- `trace`: FUSE operations, cache hits/misses, path resolution
+- `debug`: Image conversion start/completion, file discoveries
+- `info`: Mount/unmount, cache loading, worker thread status
+- `warn`: Configuration issues, fallback behaviors
+
+### Configuration Pattern
+All hardcoded values should be moved to YAML configuration with sensible defaults.
+
+### Testing Strategy
+Unit tests for format detection, cache key generation, and configuration parsing.
+Integration tests require actual image files and temporary directories.
+
+### Memory Management
+Streaming I/O for large images, configurable cache sizes, explicit cleanup on unmount.

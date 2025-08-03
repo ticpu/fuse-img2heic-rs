@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::cache::{create_cache_key, ImageCache};
+use crate::cache::{create_cache_key_and_context_for_path, ImageCache};
 use crate::config::Config;
 use crate::file_detector::FileDetector;
 use crate::image_converter;
@@ -36,7 +36,11 @@ impl ImageFuseFS {
         info!("Initializing ImageFuseFS");
 
         let cache_dir = config.get_cache_dir_from_config()?;
-        let cache = ImageCache::new(config.cache.max_size_mb, cache_dir)?;
+        let cache = ImageCache::new(
+            config.cache.max_size_mb,
+            cache_dir,
+            config.cache.enable_encryption,
+        )?;
 
         let num_workers = num_cpus::get();
         let thread_pool = Arc::new(ConversionThreadPool::new(num_workers));
@@ -86,6 +90,20 @@ impl ImageFuseFS {
     fn get_real_path(&self, virtual_path: &Path) -> Option<PathBuf> {
         self.file_detector
             .get_real_path(virtual_path, &self.config.source_paths)
+    }
+
+    fn preserve_original_timestamps(&self, attr: &mut FileAttr, real_path: &Path) {
+        if let Ok(metadata) = std::fs::metadata(real_path) {
+            if let Ok(mtime) = metadata.modified() {
+                attr.mtime = mtime;
+            }
+            if let Ok(atime) = metadata.accessed() {
+                attr.atime = atime;
+            }
+            if let Ok(ctime) = metadata.created() {
+                attr.crtime = ctime;
+            }
+        }
     }
 
     fn create_file_attr(&self, size: u64, is_dir: bool) -> FileAttr {
@@ -202,9 +220,13 @@ impl Filesystem for ImageFuseFS {
 
             // Check cache first for converted file size
             let original_size = std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0);
-            let cache_key =
-                crate::cache::create_cache_key(&real_path.to_string_lossy(), original_size);
-            let size = if let Some(cached_data) = self.cache.get(&cache_key) {
+            let (cache_key, context) = create_cache_key_and_context_for_path(
+                &real_path,
+                original_size,
+                &self.config.heic_settings,
+            );
+            let size = if let Some(cached_data) = self.cache.get_with_context(&cache_key, &context)
+            {
                 // Use cached converted size
                 cached_data.len() as u64
             } else {
@@ -216,17 +238,7 @@ impl Filesystem for ImageFuseFS {
             attr.ino = inode;
 
             // Preserve original file timestamps
-            if let Ok(metadata) = std::fs::metadata(&real_path) {
-                if let Ok(mtime) = metadata.modified() {
-                    attr.mtime = mtime;
-                }
-                if let Ok(atime) = metadata.accessed() {
-                    attr.atime = atime;
-                }
-                if let Ok(ctime) = metadata.created() {
-                    attr.crtime = ctime;
-                }
-            }
+            self.preserve_original_timestamps(&mut attr, &real_path);
 
             reply.entry(&self.ttl, &attr, 0);
             return;
@@ -270,27 +282,30 @@ impl Filesystem for ImageFuseFS {
 
         // Check if it's a file
         if let Some(real_path) = self.get_real_path(&virtual_path) {
-            let size = if image_converter::is_convertible_format(&real_path) {
+            // Check cache first for converted file size (same logic as lookup)
+            let original_size = std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0);
+            let (cache_key, context) = create_cache_key_and_context_for_path(
+                &real_path,
+                original_size,
+                &self.config.heic_settings,
+            );
+            let size = if let Some(cached_data) = self.cache.get_with_context(&cache_key, &context)
+            {
+                // Use cached converted size
+                cached_data.len() as u64
+            } else if image_converter::is_convertible_format(&real_path) {
+                // Use estimation for convertible files without cache
                 self.estimate_converted_size(&real_path)
             } else {
-                std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0)
+                // Use original file size for non-convertible files
+                original_size
             };
 
             let mut attr = self.create_file_attr(size, false);
             attr.ino = ino;
 
             // Preserve original file timestamps
-            if let Ok(metadata) = std::fs::metadata(&real_path) {
-                if let Ok(mtime) = metadata.modified() {
-                    attr.mtime = mtime;
-                }
-                if let Ok(atime) = metadata.accessed() {
-                    attr.atime = atime;
-                }
-                if let Ok(ctime) = metadata.created() {
-                    attr.crtime = ctime;
-                }
-            }
+            self.preserve_original_timestamps(&mut attr, &real_path);
 
             reply.attr(&self.ttl, &attr);
             return;
@@ -339,10 +354,14 @@ impl Filesystem for ImageFuseFS {
 
         // Create cache key
         let original_size = std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0);
-        let cache_key = create_cache_key(&real_path.to_string_lossy(), original_size);
+        let (cache_key, context) = create_cache_key_and_context_for_path(
+            &real_path,
+            original_size,
+            &self.config.heic_settings,
+        );
 
         // Try cache first
-        if let Some(cached_data) = self.cache.get(&cache_key) {
+        if let Some(cached_data) = self.cache.get_with_context(&cache_key, &context) {
             log::trace!("Serving from cache: {real_path:?}");
             let end = std::cmp::min(offset as usize + size as usize, cached_data.len());
             let start = std::cmp::min(offset as usize, cached_data.len());
@@ -368,7 +387,10 @@ impl Filesystem for ImageFuseFS {
                         "Conversion successful, {} bytes, caching result",
                         converted_data.len()
                     );
-                    if let Err(e) = self.cache.put(cache_key, converted_data.clone()) {
+                    if let Err(e) =
+                        self.cache
+                            .put_with_context(cache_key, converted_data.clone(), &context)
+                    {
                         warn!("Failed to cache converted image: {e}");
                     }
                     converted_data
@@ -379,7 +401,11 @@ impl Filesystem for ImageFuseFS {
                     match std::fs::read(&real_path) {
                         Ok(original_data) => {
                             debug!("Using original file, {} bytes", original_data.len());
-                            if let Err(e) = self.cache.put(cache_key, original_data.clone()) {
+                            if let Err(e) = self.cache.put_with_context(
+                                cache_key.clone(),
+                                original_data.clone(),
+                                &context,
+                            ) {
                                 warn!("Failed to cache original image: {e}");
                             }
                             original_data
@@ -396,7 +422,10 @@ impl Filesystem for ImageFuseFS {
             // Serve original file
             match std::fs::read(&real_path) {
                 Ok(original_data) => {
-                    if let Err(e) = self.cache.put(cache_key, original_data.clone()) {
+                    if let Err(e) =
+                        self.cache
+                            .put_with_context(cache_key, original_data.clone(), &context)
+                    {
                         warn!("Failed to cache original file: {e}");
                     }
                     original_data
