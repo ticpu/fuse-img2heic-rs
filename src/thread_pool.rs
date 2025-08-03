@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossbeam::channel::{self, Sender};
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -33,7 +33,7 @@ impl ConversionThreadPool {
             let receiver = Arc::clone(&receiver);
 
             let handle = thread::spawn(move || {
-                debug!("Worker {id} started");
+                trace!("Worker {id} started");
 
                 while let Ok(job) = receiver.recv() {
                     debug!("Worker {} processing job for: {:?}", id, job.input_path);

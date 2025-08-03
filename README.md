@@ -51,8 +51,10 @@ mount_point: "/tmp/fuse-img2heic"
 source_paths:
   - path: "~/Pictures"
     recursive: true
+    mount_name: "pictures"     # Appears as pictures/ in mount
   - path: "~/Downloads"
     recursive: false
+    mount_name: "downloads"    # Appears as downloads/ in mount
 
 filename_patterns:
   - ".*\\.(jpg|jpeg|png|gif|heic|webp|bmp|tiff)$"

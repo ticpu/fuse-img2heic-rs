@@ -6,17 +6,20 @@ mount_point: "/tmp/fuse-img2heic"
 
 # Source paths to scan for images
 source_paths:
-  # Recursive scan of Pictures directory
+  # Recursive scan of Pictures directory (appears as "pictures/" in mount)
   - path: "~/Pictures"
     recursive: true
+    mount_name: "pictures"
 
-  # Non-recursive scan of Downloads (for quick access to recent downloads)
+  # Non-recursive scan of Downloads (appears as "downloads/" in mount)
   - path: "~/Downloads"
     recursive: false
+    mount_name: "downloads"
 
   # Add more paths as needed
   # - path: "/media/photos"
   #   recursive: true
+  #   mount_name: "media"
 
 # Filename patterns to match (regex)
 filename_patterns:
@@ -48,7 +51,14 @@ cache:
   # If not specified, uses ~/.cache/fuse-img2heic-rs
   # cache_dir: "/custom/cache/path"
 
+# FUSE filesystem settings
+fuse:
+  # How long FUSE should cache filesystem operations (seconds)
+  # Higher values = better performance, lower values = more responsive to file changes
+  cache_timeout: 60
+
 # Logging configuration
 logging:
   # Log level: error, warn, info, debug, trace
-  level: "info"
+  # Default: warn (use -v for info, -vv for debug)
+  level: "warn"

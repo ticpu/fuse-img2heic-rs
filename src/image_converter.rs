@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use image::GenericImageView;
+use image::{DynamicImage, GenericImageView};
 use libheif_rs::{
     Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, Image, LibHeif, RgbChroma,
 };
@@ -9,6 +9,56 @@ use std::path::Path;
 
 use crate::config::HeicSettings;
 use crate::file_detector::ImageFormat;
+
+fn decode_heic_with_libheif(input_data: &[u8]) -> Result<DynamicImage> {
+    let lib_heif = LibHeif::new();
+
+    // Read HEIC data from bytes
+    let ctx = HeifContext::read_from_bytes(input_data).context("Failed to read HEIC data")?;
+
+    // Get primary image handle
+    let handle = ctx
+        .primary_image_handle()
+        .context("Failed to get primary image handle")?;
+
+    // Decode the image to RGB format
+    let image = lib_heif
+        .decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), None)
+        .context("Failed to decode HEIC image")?;
+
+    // Get image dimensions
+    let width = image.width();
+    let height = image.height();
+
+    debug!("Decoded HEIC image: {width}x{height}");
+
+    // Get pixel data from interleaved RGB planes
+    let planes = image.planes();
+    let interleaved_plane = planes
+        .interleaved
+        .ok_or_else(|| anyhow::anyhow!("No interleaved plane available"))?;
+
+    // Create RGB image buffer from the plane data
+    let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
+
+    // Copy RGB data accounting for stride
+    for y in 0..height {
+        let row_start = (y * interleaved_plane.stride as u32) as usize;
+        let row_end = row_start + (width * 3) as usize;
+
+        if row_end <= interleaved_plane.data.len() {
+            rgb_data.extend_from_slice(&interleaved_plane.data[row_start..row_end]);
+        } else {
+            anyhow::bail!("Invalid image data: row {} extends beyond data buffer", y);
+        }
+    }
+
+    // Create DynamicImage from RGB data
+    let rgb_image = image::RgbImage::from_raw(width, height, rgb_data)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create RGB image from decoded data"))?;
+
+    Ok(DynamicImage::ImageRgb8(rgb_image))
+}
 
 pub fn convert_to_heic_blocking(
     input_path: &Path,
@@ -20,13 +70,52 @@ pub fn convert_to_heic_blocking(
     let input_data = fs::read(input_path)
         .with_context(|| format!("Failed to read input image: {input_path:?}"))?;
 
-    // Load image using the image crate
-    let img = image::load_from_memory(&input_data)
-        .with_context(|| format!("Failed to decode image: {input_path:?}"))?;
+    // Load image - use libheif for HEIC files, image crate for others
+    let img = if input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+        == Some("heic")
+    {
+        // Use libheif-rs to decode HEIC files
+        decode_heic_with_libheif(&input_data)
+            .with_context(|| format!("Failed to decode HEIC image: {input_path:?}"))?
+    } else {
+        // Use image crate for other formats
+        image::load_from_memory(&input_data)
+            .with_context(|| format!("Failed to decode image: {input_path:?}"))?
+    };
 
     // Convert to RGB8 format for HEIC encoding
-    let rgb_img = img.to_rgb8();
-    let (width, height) = rgb_img.dimensions();
+    let mut rgb_img = img.to_rgb8();
+    let (mut width, mut height) = rgb_img.dimensions();
+
+    // Resize if image exceeds configured maximum resolution
+    if heic_settings.should_resize(width, height) {
+        if let Some((max_width, max_height)) = heic_settings.get_max_resolution() {
+            // Calculate resize dimensions while preserving aspect ratio
+            let width_ratio = max_width as f64 / width as f64;
+            let height_ratio = max_height as f64 / height as f64;
+            let scale_ratio = width_ratio.min(height_ratio);
+
+            let new_width = (width as f64 * scale_ratio) as u32;
+            let new_height = (height as f64 * scale_ratio) as u32;
+
+            debug!("Resizing image from {width}x{height} to {new_width}x{new_height}");
+
+            // Resize using the image crate's resize method
+            let resized_img = image::DynamicImage::ImageRgb8(rgb_img).resize(
+                new_width,
+                new_height,
+                image::imageops::FilterType::Lanczos3,
+            );
+
+            rgb_img = resized_img.to_rgb8();
+            width = new_width;
+            height = new_height;
+        }
+    }
 
     debug!("Image dimensions: {width}x{height}");
 
@@ -196,6 +285,7 @@ mod tests {
             quality: 50,
             speed: 4,
             chroma: 420,
+            max_resolution: None,
         };
 
         let estimated_size = estimate_heic_size(&test_file, &settings)?;

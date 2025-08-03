@@ -10,6 +10,8 @@ pub struct Config {
     pub filename_patterns: Vec<String>,
     pub heic_settings: HeicSettings,
     pub cache: CacheSettings,
+    #[serde(default)]
+    pub fuse: FuseSettings,
     pub logging: LoggingSettings,
 }
 
@@ -17,6 +19,8 @@ pub struct Config {
 pub struct SourcePath {
     pub path: PathBuf,
     pub recursive: bool,
+    /// Name to appear in the FUSE mount (e.g., "pictures", "downloads")
+    pub mount_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,12 +28,55 @@ pub struct HeicSettings {
     pub quality: u8,
     pub speed: u8,
     pub chroma: u16,
+    /// Maximum pixel resolution - images larger than this will be resized
+    /// Format: "width,height" or "2560,1440" for 1440p. None = no limit
+    pub max_resolution: Option<String>,
+}
+
+impl HeicSettings {
+    /// Parse max_resolution string into (width, height) tuple
+    /// Returns None if no limit is set or parsing fails
+    pub fn get_max_resolution(&self) -> Option<(u32, u32)> {
+        if let Some(ref res_str) = self.max_resolution {
+            if let Some((width_str, height_str)) = res_str.split_once(',') {
+                if let (Ok(width), Ok(height)) =
+                    (width_str.trim().parse(), height_str.trim().parse())
+                {
+                    return Some((width, height));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if image dimensions exceed the configured limit
+    pub fn should_resize(&self, width: u32, height: u32) -> bool {
+        if let Some((max_width, max_height)) = self.get_max_resolution() {
+            width > max_width || height > max_height
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheSettings {
     pub max_size_mb: u64,
     pub cache_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuseSettings {
+    /// How long FUSE should cache filesystem operations (seconds)
+    pub cache_timeout: u64,
+}
+
+impl Default for FuseSettings {
+    fn default() -> Self {
+        Self {
+            cache_timeout: 60, // Cache for 1 minute
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,25 +88,38 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mount_point: PathBuf::from("/tmp/fuse-img2heic"),
-            source_paths: vec![SourcePath {
-                path: PathBuf::from(format!(
-                    "{}/Pictures",
-                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
-                )),
-                recursive: true,
-            }],
+            source_paths: vec![
+                SourcePath {
+                    path: PathBuf::from(format!(
+                        "{}/Pictures",
+                        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+                    )),
+                    recursive: true,
+                    mount_name: "pictures".to_string(),
+                },
+                SourcePath {
+                    path: PathBuf::from(format!(
+                        "{}/Downloads",
+                        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+                    )),
+                    recursive: false,
+                    mount_name: "downloads".to_string(),
+                },
+            ],
+            fuse: FuseSettings::default(),
             filename_patterns: vec![r".*\.(jpg|jpeg|png|gif|heic)$".to_string()],
             heic_settings: HeicSettings {
                 quality: 50,
                 speed: 4,
                 chroma: 420,
+                max_resolution: None, // No limit by default
             },
             cache: CacheSettings {
                 max_size_mb: 1024,
                 cache_dir: None, // Will use default XDG cache dir
             },
             logging: LoggingSettings {
-                level: "info".to_string(),
+                level: "warn".to_string(),
             },
         }
     }

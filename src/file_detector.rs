@@ -3,7 +3,6 @@ use log::debug;
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 use crate::config::SourcePath;
 
@@ -49,8 +48,13 @@ impl ImageFormat {
 
     pub fn should_convert(&self) -> bool {
         match self {
-            Self::Jpeg | Self::Png | Self::Gif | Self::Webp | Self::Bmp | Self::Tiff => true,
-            Self::Heic => false, // Already in target format
+            Self::Jpeg
+            | Self::Png
+            | Self::Gif
+            | Self::Webp
+            | Self::Bmp
+            | Self::Tiff
+            | Self::Heic => true,
         }
     }
 }
@@ -128,75 +132,102 @@ impl FileDetector {
         Ok(None)
     }
 
-    pub fn discover_images(&self, source_paths: &[SourcePath]) -> Result<Vec<PathBuf>> {
-        let mut image_files = Vec::new();
-
-        for source_path in source_paths {
-            debug!(
-                "Discovering images in: {:?} (recursive: {})",
-                source_path.path, source_path.recursive
-            );
-
-            if !source_path.path.exists() {
-                log::warn!("Source path does not exist: {:?}", source_path.path);
-                continue;
-            }
-
-            if source_path.path.is_file() {
-                if self.is_image_file(&source_path.path) {
-                    image_files.push(source_path.path.clone());
-                }
-                continue;
-            }
-
-            // Walk directory
-            let walker = if source_path.recursive {
-                WalkDir::new(&source_path.path)
-            } else {
-                WalkDir::new(&source_path.path).max_depth(1)
-            };
-
-            for entry in walker {
-                match entry {
-                    Ok(entry) => {
-                        let path = entry.path();
-                        if path.is_file() && self.is_image_file(path) {
-                            image_files.push(path.to_path_buf());
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Error walking directory: {e}");
-                    }
-                }
-            }
+    /// List entries in a specific virtual directory with path exclusions (e.g., mount points)
+    pub fn list_virtual_directory_with_exclusions(
+        &self,
+        virtual_dir: &Path,
+        source_paths: &[SourcePath],
+        exclude_paths: &[&Path],
+    ) -> Result<Vec<(String, bool)>> {
+        // (name, is_directory)
+        if virtual_dir == Path::new("/") {
+            return self.list_root_directory(source_paths);
         }
 
-        debug!("Discovered {} image files", image_files.len());
-        Ok(image_files)
+        let (mount_name, subpath) = self.parse_virtual_path(virtual_dir)?;
+        let source_path = self.find_source_by_mount_name(&mount_name, source_paths)?;
+        let real_dir = source_path.path.join(subpath);
+
+        self.list_real_directory_with_exclusions(&real_dir, exclude_paths)
     }
 
-    pub fn get_virtual_path(
-        &self,
-        real_path: &Path,
-        source_paths: &[SourcePath],
-    ) -> Option<PathBuf> {
-        // Find which source path this file belongs to
+    fn list_root_directory(&self, source_paths: &[SourcePath]) -> Result<Vec<(String, bool)>> {
+        let mut entries = Vec::new();
         for source_path in source_paths {
-            if let Ok(relative) = real_path.strip_prefix(&source_path.path) {
-                // Convert extension to .heic if it's a convertible format
-                if let Ok(Some(format)) = self.detect_format(real_path) {
-                    if format.should_convert() {
-                        let mut virtual_path = PathBuf::from(relative);
-                        virtual_path.set_extension("heic");
-                        return Some(virtual_path);
-                    }
-                }
-                // Return as-is for non-convertible formats
-                return Some(relative.to_path_buf());
+            if source_path.path.exists() {
+                entries.push((source_path.mount_name.clone(), true));
             }
         }
+        Ok(entries)
+    }
 
-        None
+    fn parse_virtual_path<'a>(&self, virtual_dir: &'a Path) -> Result<(String, &'a Path)> {
+        let mut components = virtual_dir.components();
+        let mount_name = components
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid virtual path"))?;
+        let subpath = components.as_path();
+        Ok((mount_name.to_string(), subpath))
+    }
+
+    fn find_source_by_mount_name<'a>(
+        &self,
+        mount_name: &str,
+        source_paths: &'a [SourcePath],
+    ) -> Result<&'a SourcePath> {
+        source_paths
+            .iter()
+            .find(|sp| sp.mount_name == mount_name)
+            .ok_or_else(|| anyhow::anyhow!("Mount name not found: {}", mount_name))
+    }
+
+    fn list_real_directory_with_exclusions(
+        &self,
+        real_dir: &Path,
+        exclude_paths: &[&Path],
+    ) -> Result<Vec<(String, bool)>> {
+        if !real_dir.exists() || !real_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(real_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Skip excluded paths (like mount points)
+            if exclude_paths.iter().any(|exclude| path == *exclude) {
+                debug!("Skipping excluded path: {path:?}");
+                continue;
+            }
+
+            if path.is_dir() {
+                entries.push((name.to_string(), true));
+            } else if self.is_image_file(&path) {
+                let display_name = self.get_display_name(&path, name);
+                entries.push((display_name, false));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn get_display_name(&self, path: &Path, original_name: &str) -> String {
+        // Fast extension-only check for directory listings
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if let Some(format) = ImageFormat::from_extension(ext) {
+                if format.should_convert() {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        return format!("{stem}.heic");
+                    }
+                }
+            }
+        }
+        original_name.to_string()
     }
 
     pub fn get_real_path(
@@ -204,27 +235,50 @@ impl FileDetector {
         virtual_path: &Path,
         source_paths: &[SourcePath],
     ) -> Option<PathBuf> {
-        // Try to find the real file by checking all possible extensions
+        // Virtual path now starts with mount_name, e.g., "pictures/vacation/photo.heic"
+        let mut components = virtual_path.components();
+        let mount_name = components.next()?.as_os_str().to_str()?;
+        let relative_path = components.as_path();
+
+        log::trace!("get_real_path: mount_name={mount_name}, relative_path={relative_path:?}");
+
+        // Find the source path that matches this mount name
         for source_path in source_paths {
-            let base_path = source_path.path.join(virtual_path);
+            if source_path.mount_name == mount_name {
+                let base_path = source_path.path.join(relative_path);
+                log::trace!("get_real_path: base_path={base_path:?}");
 
-            // If requesting a .heic file, try to find the original with different extensions
-            if virtual_path.extension().is_some_and(|ext| ext == "heic") {
-                let stem = base_path.file_stem()?;
-                let parent = base_path.parent()?;
+                // If requesting a .heic file, try to find the original with any supported extension
+                if virtual_path.extension().is_some_and(|ext| ext == "heic") {
+                    let stem = base_path.file_stem()?;
+                    let parent = base_path.parent()?;
+                    log::trace!("get_real_path: searching for stem={stem:?} in parent={parent:?}");
 
-                let extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"];
-                for ext in &extensions {
-                    let real_path = parent.join(format!("{}.{}", stem.to_str()?, ext));
-                    if real_path.exists() && self.is_image_file(&real_path) {
-                        return Some(real_path);
+                    // Check all supported extensions including heic (for recompression with new settings)
+                    let extensions = ["heic", "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"];
+                    for ext in &extensions {
+                        let real_path = parent.join(format!("{}.{}", stem.to_str()?, ext));
+                        log::trace!("get_real_path: checking {real_path:?}");
+                        if real_path.exists() {
+                            // Only do expensive content check if extension suggests it's an image
+                            if let Some(ext) = real_path.extension().and_then(|e| e.to_str()) {
+                                if ImageFormat::from_extension(ext).is_some() {
+                                    log::trace!("get_real_path: found source file for recompression {real_path:?}");
+                                    return Some(real_path);
+                                }
+                            }
+                        }
+                    }
+                    log::trace!("get_real_path: no matching file found for {virtual_path:?}");
+                } else {
+                    // Direct mapping for non-heic files
+                    if base_path.exists() && self.is_image_file(&base_path) {
+                        return Some(base_path);
                     }
                 }
-            } else {
-                // Direct mapping for non-heic files
-                if base_path.exists() && self.is_image_file(&base_path) {
-                    return Some(base_path);
-                }
+
+                // Only check the matching source path
+                break;
             }
         }
 

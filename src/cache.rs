@@ -1,7 +1,8 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -55,7 +56,7 @@ impl ImageCache {
 
         // Try memory cache first
         if let Some(entry) = self.data.get(key) {
-            debug!("Cache hit (memory): {key}");
+            log::trace!("Cache hit (memory): {key}");
             return Some(entry.data.clone());
         }
 
@@ -80,14 +81,14 @@ impl ImageCache {
             }
         }
 
-        debug!("Cache miss: {key}");
+        log::trace!("Cache miss: {key}");
         None
     }
 
     pub fn put(&self, key: String, data: Vec<u8>) -> Result<()> {
         let size = data.len() as u64;
 
-        debug!("Caching entry: {key} ({size} bytes)");
+        log::trace!("Caching entry: {key} ({size} bytes)");
 
         // Check if we need to evict entries to make space
         self.ensure_space(size);
@@ -181,31 +182,51 @@ impl ImageCache {
 
         debug!("Loading cache entries from disk");
 
-        let entries = fs::read_dir(&self.cache_dir)?;
         let mut loaded_count = 0;
         let mut total_size = 0u64;
 
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
+        // Scan all subdirectories (xx format)
+        for subdir_entry in fs::read_dir(&self.cache_dir)? {
+            let subdir_entry = subdir_entry?;
+            let subdir_path = subdir_entry.path();
 
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "cache") {
-                if let Some(key) = path.file_stem().and_then(|s| s.to_str()) {
-                    match fs::read(&path) {
+            if !subdir_path.is_dir() {
+                continue;
+            }
+
+            let subdir_name = match subdir_path.file_name().and_then(|n| n.to_str()) {
+                Some(name) if name.len() == 2 => name,
+                _ => continue, // Skip non-hash subdirectories
+            };
+
+            // Scan files in subdirectory
+            for file_entry in fs::read_dir(&subdir_path)? {
+                let file_entry = file_entry?;
+                let file_path = file_entry.path();
+
+                if !file_path.is_file() {
+                    continue;
+                }
+
+                if let Some(filename) = file_path.file_name().and_then(|n| n.to_str()) {
+                    // Reconstruct the full hash key
+                    let cache_key = format!("{subdir_name}{filename}");
+
+                    match fs::read(&file_path) {
                         Ok(data) => {
                             let size = data.len() as u64;
                             if total_size + size <= self.max_size {
                                 let cache_entry = CacheEntry { data, size };
 
-                                self.data.insert(key.to_string(), cache_entry);
-                                self.access_times.insert(key.to_string(), Instant::now());
+                                self.data.insert(cache_key.clone(), cache_entry);
+                                self.access_times.insert(cache_key, Instant::now());
                                 total_size += size;
                                 loaded_count += 1;
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to load cache entry from {path:?}: {e}");
-                            let _ = fs::remove_file(&path); // Remove corrupted file
+                            warn!("Failed to load cache entry from {file_path:?}: {e}");
+                            let _ = fs::remove_file(&file_path); // Remove corrupted file
                         }
                     }
                 }
@@ -219,32 +240,45 @@ impl ImageCache {
     }
 
     fn save_to_disk_key(&self, key: &str, data: &[u8]) -> Result<()> {
-        let file_path = self
-            .cache_dir
-            .join(format!("{}.cache", key.replace('/', "_")));
+        let file_path = get_cache_file_path(&self.cache_dir, key);
+
+        // Create subdirectory if it doesn't exist
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
         fs::write(file_path, data)?;
         Ok(())
     }
 
     fn load_from_disk_key(&self, key: &str) -> Result<Vec<u8>> {
-        let file_path = self
-            .cache_dir
-            .join(format!("{}.cache", key.replace('/', "_")));
+        let file_path = get_cache_file_path(&self.cache_dir, key);
         Ok(fs::read(file_path)?)
     }
 
     fn remove_from_disk_key(&self, key: &str) -> Result<()> {
-        let file_path = self
-            .cache_dir
-            .join(format!("{}.cache", key.replace('/', "_")));
+        let file_path = get_cache_file_path(&self.cache_dir, key);
         fs::remove_file(file_path)?;
         Ok(())
     }
 }
 
-pub fn create_cache_key(path: &str, target_size: Option<u64>) -> String {
-    match target_size {
-        Some(size) => format!("{path}#{size}"),
-        None => path.to_string(),
-    }
+/// Create a cache key from filepath and original file size using SHA256
+/// Returns the hash that will be used for both memory cache key and disk file path
+pub fn create_cache_key(filepath: &str, original_size: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(filepath.as_bytes());
+    hasher.update(original_size.to_le_bytes());
+
+    let hash = hasher.finalize();
+    hex::encode(hash)
+}
+
+/// Get the disk file path for a cache key using the xx/xxxxx directory structure
+fn get_cache_file_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
+    // Take first 2 characters for subdirectory, remainder for filename
+    let subdir = &cache_key[0..2];
+    let filename = &cache_key[2..];
+
+    cache_dir.join(subdir).join(filename)
 }

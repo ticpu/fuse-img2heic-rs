@@ -8,6 +8,7 @@ mod config;
 mod file_detector;
 mod filesystem;
 mod image_converter;
+mod mount_management;
 mod thread_pool;
 
 use crate::config::Config;
@@ -36,6 +37,9 @@ struct Args {
 
     #[arg(short, long, help = "Run in foreground mode")]
     foreground: bool,
+
+    #[arg(short, long, action = clap::ArgAction::Count, help = "Verbose logging (-v = INFO, -vv = DEBUG, -vvv = TRACE)")]
+    verbose: u8,
 }
 
 #[derive(Subcommand)]
@@ -76,9 +80,24 @@ fn setup() -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
-
     let args = Args::parse();
+
+    // Set up logging based on verbosity
+    let log_level = match args.verbose {
+        0 => "warn",  // Default: warnings only
+        1 => "info",  // -v: info and above
+        2 => "debug", // -vv: debug and above (shows conversion activity)
+        _ => "trace", // -vvv+: trace everything
+    };
+
+    let fuser_level = if args.verbose >= 3 {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Off
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+        .filter_module("fuser", fuser_level) // Only show fuser logs at -vvv
+        .init();
 
     // Handle subcommands
     match args.command {
@@ -97,28 +116,16 @@ fn main() -> Result<()> {
     // Use mount point from CLI arg or config file
     let mount_point = args.mount.unwrap_or(config.mount_point.clone());
 
-    // Ensure mount point exists
-    if !mount_point.exists() {
-        info!("Creating mount point: {:?}", mount_point);
-        std::fs::create_dir_all(&mount_point)?;
-    }
+    // Ensure mount point exists and is accessible
+    mount_management::ensure_mount_point_accessible(&mount_point)?;
 
     info!("Initializing FUSE filesystem");
-    let fs = ImageFuseFS::new(config)?;
+    let fs = ImageFuseFS::new(&config, mount_point.clone())?;
 
     // Set up signal handling for graceful shutdown
-    let mount_point_clone = mount_point.clone();
-    ctrlc::set_handler(move || {
-        info!("Received shutdown signal, unmounting filesystem");
-        // Attempt to unmount the filesystem
-        let _ = std::process::Command::new("fusermount")
-            .args(["-u", mount_point_clone.to_str().unwrap_or("")])
-            .output();
-        std::process::exit(0);
-    })
-    .expect("Error setting signal handler");
+    mount_management::setup_shutdown_handler(mount_point.clone())?;
 
-    info!("Mounting filesystem at: {:?}", mount_point);
+    info!("Mounting filesystem at: {mount_point:?}");
     let options = vec![
         fuser::MountOption::FSName("fuse-img2heic".to_string()),
         fuser::MountOption::AllowOther,
@@ -127,10 +134,14 @@ fn main() -> Result<()> {
 
     if args.foreground {
         info!("Running in foreground mode");
-        fuser::mount2(fs, &mount_point, &options)?;
+        if let Err(e) = fuser::mount2(fs, &mount_point, &options) {
+            return Err(anyhow::anyhow!("Failed to mount filesystem: {e}"));
+        }
     } else {
         info!("Running in background mode");
-        fuser::spawn_mount2(fs, &mount_point, &options)?;
+        if let Err(e) = fuser::spawn_mount2(fs, &mount_point, &options) {
+            return Err(anyhow::anyhow!("Failed to spawn mount filesystem: {e}"));
+        }
 
         // Keep the main thread alive
         loop {

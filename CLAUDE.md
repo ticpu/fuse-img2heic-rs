@@ -79,3 +79,7 @@ systemctl --user enable fuse-img2heic.service
 - **Thread Safety**: DashMap for concurrent cache access, crossbeam channels for job distribution
 
 This project solves remote bandwidth limitations while maintaining transparent file access through the standard filesystem interface.
+
+## Development Memories
+
+- Hard coding is bad, instead, add a configuration option in the YAML
