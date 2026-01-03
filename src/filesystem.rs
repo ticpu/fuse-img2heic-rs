@@ -1,15 +1,16 @@
 use anyhow::Result;
+use bytes::Bytes;
 use dashmap::DashMap;
-use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request,
-};
+use fuse3::raw::prelude::*;
+use fuse3::{Errno, FileType, Inode, Timestamp};
+use futures_util::stream::{self, BoxStream};
 use log::{debug, error, info, warn};
 use std::ffi::OsStr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cache::{create_cache_key_and_context_for_path, ImageCache};
 use crate::config::Config;
@@ -17,7 +18,6 @@ use crate::file_detector::FileDetector;
 use crate::image_converter;
 use crate::thread_pool::ConversionThreadPool;
 
-// TTL is now configured per instance via config
 const ROOT_INODE: u64 = 1;
 
 pub struct ImageFuseFS {
@@ -25,11 +25,11 @@ pub struct ImageFuseFS {
     cache: Arc<ImageCache>,
     thread_pool: Arc<ConversionThreadPool>,
     file_detector: FileDetector,
-    inode_map: DashMap<u64, PathBuf>, // inode -> virtual path
-    path_map: DashMap<PathBuf, u64>,  // virtual path -> inode
+    inode_map: DashMap<u64, PathBuf>,
+    path_map: DashMap<PathBuf, u64>,
     next_inode: AtomicU64,
     mount_point: PathBuf,
-    ttl: Duration, // Cache TTL from config
+    ttl: Duration,
 }
 
 impl ImageFuseFS {
@@ -52,7 +52,6 @@ impl ImageFuseFS {
         let inode_map = DashMap::new();
         let path_map = DashMap::new();
 
-        // Initialize root directory mapping
         inode_map.insert(ROOT_INODE, PathBuf::from("/"));
         path_map.insert(PathBuf::from("/"), ROOT_INODE);
 
@@ -100,7 +99,6 @@ impl ImageFuseFS {
             .is_virtual_directory(virtual_path, &self.config.source_paths)
     }
 
-    /// Prefetch next N files in the same directory for faster sequential access
     fn prefetch_next_files(&self, current_real_path: &Path, count: usize) {
         let Some(parent) = current_real_path.parent() else {
             return;
@@ -109,7 +107,6 @@ impl ImageFuseFS {
             return;
         };
 
-        // List files in directory and find current position
         let Ok(entries) = std::fs::read_dir(parent) else {
             return;
         };
@@ -121,41 +118,31 @@ impl ImageFuseFS {
             .collect();
         files.sort();
 
-        // Find current file and prefetch next N
         let current_idx = files.iter().position(|p| p.file_name() == Some(current_name));
         if let Some(idx) = current_idx {
             for path in files.iter().skip(idx + 1).take(count) {
                 debug!("Prefetching: {path:?}");
-                self.thread_pool.prefetch(path.clone(), self.config.heic_settings.clone());
+                self.thread_pool
+                    .prefetch(path.clone(), self.config.heic_settings.clone());
             }
         }
     }
 
-    fn preserve_original_timestamps(&self, attr: &mut FileAttr, real_path: &Path) {
-        if let Ok(metadata) = std::fs::metadata(real_path) {
-            if let Ok(mtime) = metadata.modified() {
-                attr.mtime = mtime;
-            }
-            if let Ok(atime) = metadata.accessed() {
-                attr.atime = atime;
-            }
-            if let Ok(ctime) = metadata.created() {
-                attr.crtime = ctime;
-            }
-        }
+    fn system_time_to_timestamp(st: SystemTime) -> Timestamp {
+        let duration = st.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        Timestamp::new(duration.as_secs() as i64, duration.subsec_nanos())
     }
 
-    fn create_file_attr(&self, size: u64, is_dir: bool) -> FileAttr {
-        let now = SystemTime::now();
+    fn create_file_attr(&self, ino: u64, size: u64, is_dir: bool) -> FileAttr {
+        let now = Self::system_time_to_timestamp(SystemTime::now());
 
         FileAttr {
-            ino: 0, // Will be set by caller
+            ino,
             size,
             blocks: size.div_ceil(512),
             atime: now,
             mtime: now,
             ctime: now,
-            crtime: now,
             kind: if is_dir {
                 FileType::Directory
             } else {
@@ -166,8 +153,18 @@ impl ImageFuseFS {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
-            flags: 0,
             blksize: 4096,
+        }
+    }
+
+    fn preserve_original_timestamps(&self, attr: &mut FileAttr, real_path: &Path) {
+        if let Ok(metadata) = std::fs::metadata(real_path) {
+            if let Ok(mtime) = metadata.modified() {
+                attr.mtime = Self::system_time_to_timestamp(mtime);
+            }
+            if let Ok(atime) = metadata.accessed() {
+                attr.atime = Self::system_time_to_timestamp(atime);
+            }
         }
     }
 
@@ -176,8 +173,6 @@ impl ImageFuseFS {
 
         let mut entries = Vec::new();
 
-        // Use lazy directory listing - only scans the specific directory requested
-        // Exclude mount point to prevent infinite recursion
         if let Ok(dir_entries) = self.file_detector.list_virtual_directory_with_exclusions(
             virtual_dir,
             &self.config.source_paths,
@@ -207,29 +202,28 @@ impl ImageFuseFS {
 }
 
 impl Filesystem for ImageFuseFS {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> Result<(), libc::c_int> {
+    type DirEntryStream<'a> = BoxStream<'a, fuse3::Result<DirectoryEntry>>;
+    type DirEntryPlusStream<'a> = BoxStream<'a, fuse3::Result<DirectoryEntryPlus>>;
+
+    async fn init(&self, _req: Request) -> fuse3::Result<ReplyInit> {
         info!("FUSE filesystem initialized");
-        Ok(())
+        Ok(ReplyInit {
+            max_write: NonZeroU32::new(1024 * 1024).unwrap(),
+        })
     }
 
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    async fn destroy(&self, _req: Request) {
+        info!("FUSE filesystem destroyed");
+    }
+
+    async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> fuse3::Result<ReplyEntry> {
         log::trace!("lookup: parent={parent}, name={name:?}");
 
-        let parent_path = match self.get_virtual_path(parent) {
-            Some(path) => path.clone(),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
+        let parent_path = self
+            .get_virtual_path(parent)
+            .ok_or(Errno::from(libc::ENOENT))?;
 
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => {
-                reply.error(libc::EINVAL);
-                return;
-            }
-        };
+        let name_str = name.to_str().ok_or(Errno::from(libc::EINVAL))?;
 
         let virtual_path = if parent_path.as_os_str() == "/" {
             PathBuf::from(name_str)
@@ -239,13 +233,10 @@ impl Filesystem for ImageFuseFS {
 
         log::trace!("Looking up virtual path: {virtual_path:?}");
 
-        // Check if it's a real file
-        log::trace!("Attempting to resolve real path for virtual: {virtual_path:?}");
         if let Some(real_path) = self.get_real_path(&virtual_path) {
             log::trace!("Found real path: {real_path:?}");
             let inode = self.get_or_create_inode(&virtual_path);
 
-            // Check cache first for converted file size
             let original_size = std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0);
             let (cache_key, context) = create_cache_key_and_context_for_path(
                 &real_path,
@@ -254,67 +245,63 @@ impl Filesystem for ImageFuseFS {
             );
             let size = if let Some(cached_data) = self.cache.get_with_context(&cache_key, &context)
             {
-                // Use cached converted size
                 cached_data.len() as u64
             } else {
-                // Use original file size (no expensive conversion estimation)
                 original_size
             };
 
-            let mut attr = self.create_file_attr(size, false);
-            attr.ino = inode;
-
-            // Preserve original file timestamps
+            let mut attr = self.create_file_attr(inode, size, false);
             self.preserve_original_timestamps(&mut attr, &real_path);
 
-            reply.entry(&self.ttl, &attr, 0);
-            return;
-        } else {
-            log::trace!("No real path found for virtual: {virtual_path:?}");
+            return Ok(ReplyEntry {
+                ttl: self.ttl,
+                attr,
+                generation: 0,
+            });
         }
 
-        // Check if it's a directory (even empty ones)
         if self.is_virtual_directory(&virtual_path) {
             let inode = self.get_or_create_inode(&virtual_path);
-            let mut attr = self.create_file_attr(0, true);
-            attr.ino = inode;
+            let attr = self.create_file_attr(inode, 0, true);
 
-            reply.entry(&self.ttl, &attr, 0);
-            return;
+            return Ok(ReplyEntry {
+                ttl: self.ttl,
+                attr,
+                generation: 0,
+            });
         }
 
-        reply.error(libc::ENOENT);
+        Err(Errno::from(libc::ENOENT))
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        log::trace!("getattr: ino={ino}");
+    async fn getattr(
+        &self,
+        _req: Request,
+        inode: Inode,
+        _fh: Option<u64>,
+        _flags: u32,
+    ) -> fuse3::Result<ReplyAttr> {
+        log::trace!("getattr: ino={inode}");
 
-        if ino == ROOT_INODE {
-            let mut attr = self.create_file_attr(0, true);
-            attr.ino = ROOT_INODE;
-            reply.attr(&self.ttl, &attr);
-            return;
+        if inode == ROOT_INODE {
+            let attr = self.create_file_attr(ROOT_INODE, 0, true);
+            return Ok(ReplyAttr {
+                ttl: self.ttl,
+                attr,
+            });
         }
 
-        let virtual_path = match self.get_virtual_path(ino) {
-            Some(path) => path.clone(),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
+        let virtual_path = self
+            .get_virtual_path(inode)
+            .ok_or(Errno::from(libc::ENOENT))?;
 
-        // Check if it's a file
         if let Some(real_path) = self.get_real_path(&virtual_path) {
-            // Check cache first for converted file size (same logic as lookup)
             let original_size = std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0);
             let (cache_key, context) = create_cache_key_and_context_for_path(
                 &real_path,
                 original_size,
                 &self.config.heic_settings,
             );
-            // Use cached size if available, otherwise original size
-            // (kernel handles short reads at EOF fine)
             let size = if let Some(cached_data) = self.cache.get_with_context(&cache_key, &context)
             {
                 cached_data.len() as u64
@@ -322,62 +309,48 @@ impl Filesystem for ImageFuseFS {
                 original_size
             };
 
-            let mut attr = self.create_file_attr(size, false);
-            attr.ino = ino;
-
-            // Preserve original file timestamps
+            let mut attr = self.create_file_attr(inode, size, false);
             self.preserve_original_timestamps(&mut attr, &real_path);
 
-            reply.attr(&self.ttl, &attr);
-            return;
+            return Ok(ReplyAttr {
+                ttl: self.ttl,
+                attr,
+            });
         }
 
-        // Check if it's a directory (even empty ones)
         if self.is_virtual_directory(&virtual_path) {
-            let mut attr = self.create_file_attr(0, true);
-            attr.ino = ino;
-            reply.attr(&self.ttl, &attr);
-            return;
+            let attr = self.create_file_attr(inode, 0, true);
+            return Ok(ReplyAttr {
+                ttl: self.ttl,
+                attr,
+            });
         }
 
-        reply.error(libc::ENOENT);
+        Err(Errno::from(libc::ENOENT))
     }
 
-    fn read(
-        &mut self,
-        _req: &Request,
-        ino: u64,
+    async fn read(
+        &self,
+        _req: Request,
+        inode: Inode,
         _fh: u64,
-        offset: i64,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
-        log::trace!("read: ino={ino}, offset={offset}, size={size}");
+    ) -> fuse3::Result<ReplyData> {
+        log::trace!("read: ino={inode}, offset={offset}, size={size}");
 
-        let virtual_path = match self.get_virtual_path(ino) {
-            Some(path) => path.clone(),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
+        let virtual_path = self
+            .get_virtual_path(inode)
+            .ok_or(Errno::from(libc::ENOENT))?;
 
-        let real_path = match self.get_real_path(&virtual_path) {
-            Some(path) => path,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
+        let real_path = self
+            .get_real_path(&virtual_path)
+            .ok_or(Errno::from(libc::ENOENT))?;
 
-        // Prefetch next files in directory for faster sequential access
         if self.config.fuse.prefetch_count > 0 {
             self.prefetch_next_files(&real_path, self.config.fuse.prefetch_count);
         }
 
-        // Create cache key
         let original_size = std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0);
         let (cache_key, context) = create_cache_key_and_context_for_path(
             &real_path,
@@ -385,7 +358,6 @@ impl Filesystem for ImageFuseFS {
             &self.config.heic_settings,
         );
 
-        // Try cache first
         if let Some(cached_data) = self.cache.get_with_context(&cache_key, &context) {
             log::trace!("Serving from cache: {real_path:?}");
             let end = std::cmp::min(offset as usize + size as usize, cached_data.len());
@@ -394,13 +366,14 @@ impl Filesystem for ImageFuseFS {
                 "Serving cached bytes {start}-{end} of {} total",
                 cached_data.len()
             );
-            reply.data(&cached_data[start..end]);
-            return;
+            return Ok(ReplyData {
+                data: Bytes::copy_from_slice(&cached_data[start..end]),
+            });
         }
 
-        // Convert if needed
         let is_convertible = image_converter::is_convertible_format(&real_path);
         log::trace!("is_convertible_format({real_path:?}) = {is_convertible}");
+
         let data = if is_convertible {
             debug!("Converting image: {real_path:?}");
             match self
@@ -422,12 +395,10 @@ impl Filesystem for ImageFuseFS {
                 }
                 Err(e) => {
                     error!("Conversion failed for {real_path:?}: {e}");
-                    reply.error(libc::EIO);
-                    return;
+                    return Err(Errno::from(libc::EIO));
                 }
             }
         } else {
-            // Non-convertible file - serve original
             match std::fs::read(&real_path) {
                 Ok(original_data) => {
                     if let Err(e) =
@@ -440,89 +411,200 @@ impl Filesystem for ImageFuseFS {
                 }
                 Err(e) => {
                     error!("Failed to read file {real_path:?}: {e}");
-                    reply.error(libc::EIO);
-                    return;
+                    return Err(Errno::from(libc::EIO));
                 }
             }
         };
 
-        // Return requested portion
         let end = std::cmp::min(offset as usize + size as usize, data.len());
         let start = std::cmp::min(offset as usize, data.len());
         log::trace!("Serving bytes {start}-{end} of {} total", data.len());
-        reply.data(&data[start..end]);
+
+        Ok(ReplyData {
+            data: Bytes::copy_from_slice(&data[start..end]),
+        })
     }
 
-    fn readdir(
-        &mut self,
-        _req: &Request,
-        ino: u64,
+    async fn open(&self, _req: Request, inode: Inode, _flags: u32) -> fuse3::Result<ReplyOpen> {
+        log::trace!("open: ino={inode}");
+
+        let virtual_path = self
+            .get_virtual_path(inode)
+            .ok_or(Errno::from(libc::ENOENT))?;
+
+        if self.get_real_path(&virtual_path).is_some() {
+            Ok(ReplyOpen { fh: 0, flags: 0 })
+        } else {
+            Err(Errno::from(libc::ENOENT))
+        }
+    }
+
+    async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> fuse3::Result<ReplyOpen> {
+        log::trace!("opendir: ino={inode}");
+
+        if inode == ROOT_INODE {
+            return Ok(ReplyOpen { fh: 0, flags: 0 });
+        }
+
+        let virtual_path = self
+            .get_virtual_path(inode)
+            .ok_or(Errno::from(libc::ENOENT))?;
+
+        if self.is_virtual_directory(&virtual_path) {
+            Ok(ReplyOpen { fh: 0, flags: 0 })
+        } else {
+            Err(Errno::from(libc::ENOTDIR))
+        }
+    }
+
+    async fn readdir<'a>(
+        &'a self,
+        _req: Request,
+        parent: Inode,
         _fh: u64,
         offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
-        log::trace!("readdir: ino={ino}, offset={offset}");
+    ) -> fuse3::Result<ReplyDirectory<Self::DirEntryStream<'a>>> {
+        log::trace!("readdir: ino={parent}, offset={offset}");
 
-        let virtual_path = match self.get_virtual_path(ino) {
-            Some(path) => path.clone(),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
+        let virtual_path = self
+            .get_virtual_path(parent)
+            .ok_or(Errno::from(libc::ENOENT))?;
 
         let entries = self.list_directory(&virtual_path);
 
+        let mut all_entries: Vec<fuse3::Result<DirectoryEntry>> = Vec::new();
         let mut index = 0i64;
 
-        // Add . and .. entries
-        if index >= offset && reply.add(ino, index + 1, FileType::Directory, ".") {
-            reply.ok();
-            return;
-        }
+        all_entries.push(Ok(DirectoryEntry {
+            inode: parent,
+            kind: FileType::Directory,
+            name: ".".into(),
+            offset: index + 1,
+        }));
         index += 1;
 
         if virtual_path != Path::new("/") {
-            if index >= offset {
-                let parent_inode = if let Some(parent) = virtual_path.parent() {
-                    self.get_or_create_inode(parent)
-                } else {
-                    ROOT_INODE
-                };
-                if reply.add(parent_inode, index + 1, FileType::Directory, "..") {
-                    reply.ok();
-                    return;
-                }
-            }
+            let parent_inode = if let Some(parent_dir) = virtual_path.parent() {
+                self.get_or_create_inode(parent_dir)
+            } else {
+                ROOT_INODE
+            };
+            all_entries.push(Ok(DirectoryEntry {
+                inode: parent_inode,
+                kind: FileType::Directory,
+                name: "..".into(),
+                offset: index + 1,
+            }));
             index += 1;
         }
 
-        // Add discovered entries
         for (name, entry_inode, file_type) in entries {
-            if index >= offset && reply.add(entry_inode, index + 1, file_type, &name) {
-                break;
-            }
+            all_entries.push(Ok(DirectoryEntry {
+                inode: entry_inode,
+                kind: file_type,
+                name: name.into(),
+                offset: index + 1,
+            }));
             index += 1;
         }
 
-        reply.ok();
+        let stream = stream::iter(all_entries.into_iter().skip(offset as usize));
+
+        Ok(ReplyDirectory {
+            entries: Box::pin(stream),
+        })
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        log::trace!("open: ino={ino}");
+    async fn readdirplus<'a>(
+        &'a self,
+        _req: Request,
+        parent: Inode,
+        _fh: u64,
+        offset: u64,
+        _lock_owner: u64,
+    ) -> fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
+        log::trace!("readdirplus: ino={parent}, offset={offset}");
 
-        let virtual_path = match self.get_virtual_path(ino) {
-            Some(path) => path.clone(),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
+        let virtual_path = self
+            .get_virtual_path(parent)
+            .ok_or(Errno::from(libc::ENOENT))?;
 
-        if self.get_real_path(&virtual_path).is_some() {
-            reply.opened(0, 0);
-        } else {
-            reply.error(libc::ENOENT);
+        let entries = self.list_directory(&virtual_path);
+
+        let mut all_entries: Vec<fuse3::Result<DirectoryEntryPlus>> = Vec::new();
+        let mut index = 0u64;
+
+        // Add "."
+        let dot_attr = self.create_file_attr(parent, 0, true);
+        all_entries.push(Ok(DirectoryEntryPlus {
+            inode: parent,
+            generation: 0,
+            kind: FileType::Directory,
+            name: ".".into(),
+            offset: (index + 1) as i64,
+            attr: dot_attr,
+            entry_ttl: self.ttl,
+            attr_ttl: self.ttl,
+        }));
+        index += 1;
+
+        // Add ".."
+        if virtual_path != Path::new("/") {
+            let parent_inode = if let Some(parent_dir) = virtual_path.parent() {
+                self.get_or_create_inode(parent_dir)
+            } else {
+                ROOT_INODE
+            };
+            let dotdot_attr = self.create_file_attr(parent_inode, 0, true);
+            all_entries.push(Ok(DirectoryEntryPlus {
+                inode: parent_inode,
+                generation: 0,
+                kind: FileType::Directory,
+                name: "..".into(),
+                offset: (index + 1) as i64,
+                attr: dotdot_attr,
+                entry_ttl: self.ttl,
+                attr_ttl: self.ttl,
+            }));
+            index += 1;
         }
+
+        for (name, entry_inode, file_type) in entries {
+            let is_dir = file_type == FileType::Directory;
+            let mut attr = self.create_file_attr(entry_inode, 0, is_dir);
+
+            // For files, try to get size from cache or real file
+            if !is_dir {
+                let entry_virtual_path = if virtual_path == Path::new("/") {
+                    PathBuf::from(&name)
+                } else {
+                    virtual_path.join(&name)
+                };
+                if let Some(real_path) = self.get_real_path(&entry_virtual_path) {
+                    let original_size = std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0);
+                    attr.size = original_size;
+                    attr.blocks = original_size.div_ceil(512);
+                    self.preserve_original_timestamps(&mut attr, &real_path);
+                }
+            }
+
+            all_entries.push(Ok(DirectoryEntryPlus {
+                inode: entry_inode,
+                generation: 0,
+                kind: file_type,
+                name: name.into(),
+                offset: (index + 1) as i64,
+                attr,
+                entry_ttl: self.ttl,
+                attr_ttl: self.ttl,
+            }));
+            index += 1;
+        }
+
+        let stream = stream::iter(all_entries.into_iter().skip(offset as usize));
+
+        Ok(ReplyDirectoryPlus {
+            entries: Box::pin(stream),
+        })
     }
 }

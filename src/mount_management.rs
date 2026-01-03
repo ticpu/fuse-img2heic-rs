@@ -59,12 +59,3 @@ fn attempt_unmount(mount_point: &Path) -> Result<()> {
     }
 }
 
-/// Set up graceful shutdown handler
-pub fn setup_shutdown_handler(mount_point: std::path::PathBuf) -> Result<()> {
-    ctrlc::set_handler(move || {
-        info!("Received shutdown signal, unmounting filesystem");
-        let _ = attempt_unmount(&mount_point);
-        std::process::exit(0);
-    })
-    .map_err(|e| anyhow::anyhow!("Error setting signal handler: {e}"))
-}

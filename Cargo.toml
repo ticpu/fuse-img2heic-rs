@@ -7,7 +7,10 @@ description = "FUSE filesystem that transparently converts images to HEIC format
 license = "MIT"
 
 [dependencies]
-fuser = "0.13"
+fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+bytes = "1"
+futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 regex = "1.10"
@@ -23,7 +26,6 @@ num_cpus = "1.16"
 crossbeam = "0.8"
 parking_lot = "0.12"
 dashmap = "5.5"
-ctrlc = "3.4"
 libc = "0.2"
 tempfile = "3.20.0"
 sha2 = "0.10"
