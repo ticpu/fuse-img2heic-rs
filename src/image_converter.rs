@@ -208,6 +208,8 @@ pub fn is_convertible_format(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{DynamicImage, ImageFormat as ImageCrateFormat};
+    use tempfile::TempDir;
 
     #[test]
     fn test_is_convertible_format() {
@@ -216,5 +218,75 @@ mod tests {
 
         let path = Path::new("test.heic");
         let _ = is_convertible_format(path);
+    }
+
+    #[test]
+    fn test_conversion_is_deterministic_jpg() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let test_file = temp_dir.path().join("test.jpg");
+
+        // Create a test image with varied content
+        let mut img = image::RgbImage::new(200, 200);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                ((x + y) % 256) as u8,
+                ((x * 2) % 256) as u8,
+                ((y * 2) % 256) as u8,
+            ]);
+        }
+        DynamicImage::ImageRgb8(img).save_with_format(&test_file, ImageCrateFormat::Jpeg)?;
+
+        let settings = HeicSettings {
+            quality: 50,
+            speed: 4,
+            chroma: 420,
+            max_resolution: None,
+        };
+
+        // Convert twice
+        let result1 = convert_to_heic_blocking(&test_file, &settings)?;
+        let result2 = convert_to_heic_blocking(&test_file, &settings)?;
+
+        assert_eq!(
+            result1, result2,
+            "HEIC conversion must be deterministic - same input should produce identical output"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_conversion_is_deterministic_png() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let test_file = temp_dir.path().join("test.png");
+
+        // Create a test image with varied content
+        let mut img = image::RgbImage::new(200, 200);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                ((x + y) % 256) as u8,
+                ((x * 2) % 256) as u8,
+                ((y * 2) % 256) as u8,
+            ]);
+        }
+        DynamicImage::ImageRgb8(img).save_with_format(&test_file, ImageCrateFormat::Png)?;
+
+        let settings = HeicSettings {
+            quality: 50,
+            speed: 4,
+            chroma: 420,
+            max_resolution: None,
+        };
+
+        // Convert twice
+        let result1 = convert_to_heic_blocking(&test_file, &settings)?;
+        let result2 = convert_to_heic_blocking(&test_file, &settings)?;
+
+        assert_eq!(
+            result1, result2,
+            "HEIC conversion must be deterministic - same input should produce identical output"
+        );
+
+        Ok(())
     }
 }
