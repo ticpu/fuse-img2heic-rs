@@ -204,7 +204,7 @@ impl Filesystem for ImageFuseFS {
             }
         };
 
-        let virtual_path = if parent_path == PathBuf::from("/") {
+        let virtual_path = if parent_path.as_os_str() == "/" {
             PathBuf::from(name_str)
         } else {
             parent_path.join(name_str)
@@ -246,17 +246,15 @@ impl Filesystem for ImageFuseFS {
             log::trace!("No real path found for virtual: {virtual_path:?}");
         }
 
-        // Check if it's a directory (only check if it could be a directory path)
-        if virtual_path.extension().is_none() {
-            let entries = self.list_directory(&virtual_path);
-            if !entries.is_empty() {
-                let inode = self.get_or_create_inode(&virtual_path);
-                let mut attr = self.create_file_attr(0, true);
-                attr.ino = inode;
+        // Check if it's a directory (directories can have dots in their names)
+        let entries = self.list_directory(&virtual_path);
+        if !entries.is_empty() {
+            let inode = self.get_or_create_inode(&virtual_path);
+            let mut attr = self.create_file_attr(0, true);
+            attr.ino = inode;
 
-                reply.entry(&self.ttl, &attr, 0);
-                return;
-            }
+            reply.entry(&self.ttl, &attr, 0);
+            return;
         }
 
         reply.error(libc::ENOENT);
@@ -474,18 +472,20 @@ impl Filesystem for ImageFuseFS {
         }
         index += 1;
 
-        if virtual_path != Path::new("/") && index >= offset {
-            let parent_inode = if let Some(parent) = virtual_path.parent() {
-                self.get_or_create_inode(parent)
-            } else {
-                ROOT_INODE
-            };
-            if reply.add(parent_inode, index + 1, FileType::Directory, "..") {
-                reply.ok();
-                return;
+        if virtual_path != Path::new("/") {
+            if index >= offset {
+                let parent_inode = if let Some(parent) = virtual_path.parent() {
+                    self.get_or_create_inode(parent)
+                } else {
+                    ROOT_INODE
+                };
+                if reply.add(parent_inode, index + 1, FileType::Directory, "..") {
+                    reply.ok();
+                    return;
+                }
             }
+            index += 1;
         }
-        index += 1;
 
         // Add discovered entries
         for (name, entry_inode, file_type) in entries {

@@ -70,13 +70,13 @@ pub fn convert_to_heic_blocking(
     let input_data = fs::read(input_path)
         .with_context(|| format!("Failed to read input image: {input_path:?}"))?;
 
-    // Load image - use libheif for HEIC files, image crate for others
+    // Load image - use libheif for HEIC/HEIF files, image crate for others
     let img = if input_path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .as_deref()
-        == Some("heic")
+        .is_some_and(|ext| ext == "heic" || ext == "heif")
     {
         // Use libheif-rs to decode HEIC files
         decode_heic_with_libheif(&input_data)

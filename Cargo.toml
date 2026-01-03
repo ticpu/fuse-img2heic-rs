@@ -15,7 +15,6 @@ libheif-rs = "0.22"
 image = "0.24"
 infer = "0.15"
 walkdir = "2.4"
-tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"

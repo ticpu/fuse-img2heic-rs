@@ -304,7 +304,7 @@ mod tests {
     fn test_should_convert() {
         assert!(ImageFormat::Jpeg.should_convert());
         assert!(ImageFormat::Png.should_convert());
-        assert!(!ImageFormat::Heic.should_convert());
+        assert!(ImageFormat::Heic.should_convert()); // HEIC should recompress with new settings
     }
 
     #[test]

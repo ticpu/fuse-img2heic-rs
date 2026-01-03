@@ -2,21 +2,20 @@ use anyhow::Result;
 use crossbeam::channel::{self, Sender};
 use log::{debug, error, info, trace};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use tokio::sync::oneshot;
 
 use crate::config::HeicSettings;
 
-#[derive(Debug)]
 pub struct ConversionJob {
     pub input_path: PathBuf,
     pub heic_settings: HeicSettings,
-    pub result_sender: oneshot::Sender<Result<Vec<u8>>>,
+    pub result_sender: mpsc::Sender<Result<Vec<u8>>>,
 }
 
 pub struct ConversionThreadPool {
-    sender: Sender<ConversionJob>,
+    sender: Option<Sender<ConversionJob>>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -73,11 +72,16 @@ impl ConversionThreadPool {
             workers.push(handle);
         }
 
-        Self { sender, workers }
+        Self {
+            sender: Some(sender),
+            workers,
+        }
     }
 
     pub fn submit_job(&self, job: ConversionJob) -> Result<()> {
         self.sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Thread pool is shut down"))?
             .send(job)
             .map_err(|_| anyhow::anyhow!("Failed to submit conversion job - thread pool shut down"))
     }
@@ -87,7 +91,7 @@ impl ConversionThreadPool {
         input_path: PathBuf,
         heic_settings: HeicSettings,
     ) -> Result<Vec<u8>> {
-        let (result_sender, result_receiver) = oneshot::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
 
         let job = ConversionJob {
             input_path,
@@ -97,11 +101,8 @@ impl ConversionThreadPool {
 
         self.submit_job(job)?;
 
-        // Use blocking wait with a runtime
-        let rt = tokio::runtime::Handle::try_current()
-            .or_else(|_| tokio::runtime::Runtime::new().map(|rt| rt.handle().clone()))?;
-
-        rt.block_on(result_receiver)
+        result_receiver
+            .recv()
             .map_err(|_| anyhow::anyhow!("Conversion job was cancelled"))?
     }
 }
@@ -111,7 +112,7 @@ impl Drop for ConversionThreadPool {
         info!("Shutting down conversion thread pool");
 
         // Close the sender to signal workers to stop
-        drop(self.sender.clone());
+        drop(self.sender.take());
 
         // Wait for all workers to finish
         while let Some(worker) = self.workers.pop() {
