@@ -6,21 +6,23 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
+use crate::cache::{create_cache_key_and_context_for_path, ImageCache};
 use crate::config::HeicSettings;
 
 pub struct ConversionJob {
     pub input_path: PathBuf,
     pub heic_settings: HeicSettings,
-    pub result_sender: mpsc::Sender<Result<Vec<u8>>>,
+    pub result_sender: Option<mpsc::Sender<Result<Vec<u8>>>>,
 }
 
 pub struct ConversionThreadPool {
     sender: Option<Sender<ConversionJob>>,
     workers: Vec<thread::JoinHandle<()>>,
+    cache: Arc<ImageCache>,
 }
 
 impl ConversionThreadPool {
-    pub fn new(num_workers: usize) -> Self {
+    pub fn new(num_workers: usize, cache: Arc<ImageCache>) -> Self {
         let (sender, receiver) = channel::unbounded::<ConversionJob>();
         let receiver = Arc::new(receiver);
 
@@ -30,6 +32,7 @@ impl ConversionThreadPool {
 
         for id in 0..num_workers {
             let receiver = Arc::clone(&receiver);
+            let cache = Arc::clone(&cache);
 
             let handle = thread::spawn(move || {
                 trace!("Worker {id} started");
@@ -50,8 +53,23 @@ impl ConversionThreadPool {
                                 job.input_path,
                                 data.len()
                             );
-                            if job.result_sender.send(Ok(data)).is_err() {
-                                debug!("Worker {id} failed to send result - receiver dropped");
+
+                            // Always cache the result
+                            let original_size = std::fs::metadata(&job.input_path)
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            let (cache_key, context) = create_cache_key_and_context_for_path(
+                                &job.input_path,
+                                original_size,
+                                &job.heic_settings,
+                            );
+                            if let Err(e) = cache.put_with_context(cache_key, data.clone(), &context) {
+                                debug!("Worker {id} failed to cache result: {e}");
+                            }
+
+                            // Send result if someone's waiting
+                            if let Some(sender) = job.result_sender {
+                                let _ = sender.send(Ok(data));
                             }
                         }
                         Err(e) => {
@@ -59,8 +77,8 @@ impl ConversionThreadPool {
                                 "Worker {} conversion failed for {:?}: {}",
                                 id, job.input_path, e
                             );
-                            if job.result_sender.send(Err(e)).is_err() {
-                                debug!("Worker {id} failed to send error - receiver dropped");
+                            if let Some(sender) = job.result_sender {
+                                let _ = sender.send(Err(e));
                             }
                         }
                     }
@@ -75,6 +93,7 @@ impl ConversionThreadPool {
         Self {
             sender: Some(sender),
             workers,
+            cache,
         }
     }
 
@@ -96,7 +115,7 @@ impl ConversionThreadPool {
         let job = ConversionJob {
             input_path,
             heic_settings,
-            result_sender,
+            result_sender: Some(result_sender),
         };
 
         self.submit_job(job)?;
@@ -104,6 +123,28 @@ impl ConversionThreadPool {
         result_receiver
             .recv()
             .map_err(|_| anyhow::anyhow!("Conversion job was cancelled"))?
+    }
+
+    /// Submit a file for background conversion (prefetch). Result will be cached.
+    pub fn prefetch(&self, input_path: PathBuf, heic_settings: HeicSettings) {
+        // Check if already cached
+        let original_size = std::fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
+        let (cache_key, context) = create_cache_key_and_context_for_path(
+            &input_path,
+            original_size,
+            &heic_settings,
+        );
+        if self.cache.get_with_context(&cache_key, &context).is_some() {
+            return; // Already cached
+        }
+
+        let job = ConversionJob {
+            input_path,
+            heic_settings,
+            result_sender: None, // No one waiting, just cache it
+        };
+
+        let _ = self.submit_job(job); // Ignore errors for prefetch
     }
 }
 

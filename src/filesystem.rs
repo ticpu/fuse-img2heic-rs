@@ -43,7 +43,7 @@ impl ImageFuseFS {
         )?;
 
         let num_workers = num_cpus::get();
-        let thread_pool = Arc::new(ConversionThreadPool::new(num_workers));
+        let thread_pool = Arc::new(ConversionThreadPool::new(num_workers, Arc::clone(&cache)));
 
         let file_detector = FileDetector::new(config.filename_patterns.clone())?;
 
@@ -95,6 +95,37 @@ impl ImageFuseFS {
     fn is_virtual_directory(&self, virtual_path: &Path) -> bool {
         self.file_detector
             .is_virtual_directory(virtual_path, &self.config.source_paths)
+    }
+
+    /// Prefetch next N files in the same directory for faster sequential access
+    fn prefetch_next_files(&self, current_real_path: &Path, count: usize) {
+        let Some(parent) = current_real_path.parent() else {
+            return;
+        };
+        let Some(current_name) = current_real_path.file_name() else {
+            return;
+        };
+
+        // List files in directory and find current position
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && image_converter::is_convertible_format(p))
+            .collect();
+        files.sort();
+
+        // Find current file and prefetch next N
+        let current_idx = files.iter().position(|p| p.file_name() == Some(current_name));
+        if let Some(idx) = current_idx {
+            for path in files.iter().skip(idx + 1).take(count) {
+                debug!("Prefetching: {path:?}");
+                self.thread_pool.prefetch(path.clone(), self.config.heic_settings.clone());
+            }
+        }
     }
 
     fn preserve_original_timestamps(&self, attr: &mut FileAttr, real_path: &Path) {
@@ -337,6 +368,11 @@ impl Filesystem for ImageFuseFS {
                 return;
             }
         };
+
+        // Prefetch next files in directory for faster sequential access
+        if self.config.fuse.prefetch_count > 0 {
+            self.prefetch_next_files(&real_path, self.config.fuse.prefetch_count);
+        }
 
         // Create cache key
         let original_size = std::fs::metadata(&real_path).map(|m| m.len()).unwrap_or(0);

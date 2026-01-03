@@ -77,12 +77,20 @@ fn default_encryption() -> bool {
 pub struct FuseSettings {
     /// How long FUSE should cache filesystem operations (seconds)
     pub cache_timeout: u64,
+    /// Number of files to prefetch ahead during sequential access (0 to disable)
+    #[serde(default = "default_prefetch_count")]
+    pub prefetch_count: usize,
+}
+
+fn default_prefetch_count() -> usize {
+    4
 }
 
 impl Default for FuseSettings {
     fn default() -> Self {
         Self {
-            cache_timeout: 60, // Cache for 1 minute
+            cache_timeout: 60,
+            prefetch_count: 4,
         }
     }
 }
