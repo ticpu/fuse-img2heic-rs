@@ -1,5 +1,6 @@
 use anyhow::Result;
 use crossbeam::channel::{self, Sender};
+use dashmap::DashSet;
 use log::{debug, error, info, trace};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -19,12 +20,14 @@ pub struct ConversionThreadPool {
     sender: Option<Sender<ConversionJob>>,
     workers: Vec<thread::JoinHandle<()>>,
     cache: Arc<ImageCache>,
+    in_flight: Arc<DashSet<PathBuf>>,
 }
 
 impl ConversionThreadPool {
     pub fn new(num_workers: usize, cache: Arc<ImageCache>) -> Self {
         let (sender, receiver) = channel::unbounded::<ConversionJob>();
         let receiver = Arc::new(receiver);
+        let in_flight: Arc<DashSet<PathBuf>> = Arc::new(DashSet::new());
 
         info!("Starting {num_workers} conversion worker threads");
 
@@ -33,6 +36,7 @@ impl ConversionThreadPool {
         for id in 0..num_workers {
             let receiver = Arc::clone(&receiver);
             let cache = Arc::clone(&cache);
+            let in_flight = Arc::clone(&in_flight);
 
             let handle = thread::spawn(move || {
                 trace!("Worker {id} started");
@@ -44,6 +48,9 @@ impl ConversionThreadPool {
                         &job.input_path,
                         &job.heic_settings,
                     );
+
+                    // Remove from in-flight tracking
+                    in_flight.remove(&job.input_path);
 
                     match result {
                         Ok(data) => {
@@ -94,6 +101,7 @@ impl ConversionThreadPool {
             sender: Some(sender),
             workers,
             cache,
+            in_flight,
         }
     }
 
@@ -127,6 +135,11 @@ impl ConversionThreadPool {
 
     /// Submit a file for background conversion (prefetch). Result will be cached.
     pub fn prefetch(&self, input_path: PathBuf, heic_settings: HeicSettings) {
+        // Check if already in-flight
+        if self.in_flight.contains(&input_path) {
+            return;
+        }
+
         // Check if already cached
         let original_size = std::fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
         let (cache_key, context) = create_cache_key_and_context_for_path(
@@ -137,6 +150,9 @@ impl ConversionThreadPool {
         if self.cache.get_with_context(&cache_key, &context).is_some() {
             return; // Already cached
         }
+
+        // Mark as in-flight before submitting
+        self.in_flight.insert(input_path.clone());
 
         let job = ConversionJob {
             input_path,
