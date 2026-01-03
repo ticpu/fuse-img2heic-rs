@@ -278,17 +278,22 @@ impl FileDetector {
                     let parent = base_path.parent()?;
                     log::trace!("get_real_path: searching for stem={stem:?} in parent={parent:?}");
 
-                    // Check all supported extensions including heic (for recompression with new settings)
-                    let extensions = ["heic", "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"];
-                    for ext in &extensions {
-                        let real_path = parent.join(format!("{}.{}", stem.to_str()?, ext));
-                        log::trace!("get_real_path: checking {real_path:?}");
-                        if real_path.exists() {
-                            // Only do expensive content check if extension suggests it's an image
-                            if let Some(ext) = real_path.extension().and_then(|e| e.to_str()) {
+                    // Scan directory to find matching file (handles case-insensitive extensions)
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if !path.is_file() {
+                                continue;
+                            }
+                            // Check if stem matches (case-sensitive for filename)
+                            if path.file_stem() != Some(stem) {
+                                continue;
+                            }
+                            // Check if extension is a supported image format
+                            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                                 if ImageFormat::from_extension(ext).is_some() {
-                                    log::trace!("get_real_path: found source file for recompression {real_path:?}");
-                                    return Some(real_path);
+                                    log::trace!("get_real_path: found source file {path:?}");
+                                    return Some(path);
                                 }
                             }
                         }
