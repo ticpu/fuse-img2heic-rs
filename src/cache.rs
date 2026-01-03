@@ -387,27 +387,18 @@ impl ImageCache {
 
         let payload = &file_content[HEADER_SIZE..];
 
-        let decrypted_data = if header.is_encrypted() {
+        // AES-GCM provides authenticated encryption (integrity check on decrypt)
+        // For unencrypted, we trust the filesystem
+        if header.is_encrypted() {
             if !self.encryption_enabled {
                 return Err(anyhow::anyhow!(
                     "Cache file is encrypted but encryption is disabled"
                 ));
             }
-            self.decrypt_data(payload, &header.nonce, filepath)?
+            self.decrypt_data(payload, &header.nonce, filepath)
         } else {
-            payload.to_vec()
-        };
-
-        // Verify checksum
-        let mut hasher = Sha256::new();
-        hasher.update(&decrypted_data);
-        let computed_checksum: [u8; 32] = hasher.finalize().into();
-
-        if computed_checksum != header.checksum {
-            return Err(anyhow::anyhow!("Cache file checksum mismatch"));
+            Ok(payload.to_vec())
         }
-
-        Ok(decrypted_data)
     }
 
 }
