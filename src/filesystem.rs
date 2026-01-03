@@ -1,12 +1,13 @@
 use anyhow::Result;
+use dashmap::DashMap;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
 };
 use log::{debug, error, info, warn};
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -24,9 +25,9 @@ pub struct ImageFuseFS {
     cache: Arc<ImageCache>,
     thread_pool: Arc<ConversionThreadPool>,
     file_detector: FileDetector,
-    inode_map: HashMap<u64, PathBuf>, // inode -> virtual path
-    path_map: HashMap<PathBuf, u64>,  // virtual path -> inode
-    next_inode: u64,
+    inode_map: DashMap<u64, PathBuf>, // inode -> virtual path
+    path_map: DashMap<PathBuf, u64>,  // virtual path -> inode
+    next_inode: AtomicU64,
     mount_point: PathBuf,
     ttl: Duration, // Cache TTL from config
 }
@@ -48,33 +49,35 @@ impl ImageFuseFS {
         let file_detector = FileDetector::new(config.filename_patterns.clone())?;
 
         let ttl = Duration::from_secs(config.fuse.cache_timeout);
-        let mut fs = Self {
+        let inode_map = DashMap::new();
+        let path_map = DashMap::new();
+
+        // Initialize root directory mapping
+        inode_map.insert(ROOT_INODE, PathBuf::from("/"));
+        path_map.insert(PathBuf::from("/"), ROOT_INODE);
+
+        let fs = Self {
             config: config.clone(),
             cache,
             thread_pool,
             file_detector,
-            inode_map: HashMap::new(),
-            path_map: HashMap::new(),
-            next_inode: ROOT_INODE + 1,
+            inode_map,
+            path_map,
+            next_inode: AtomicU64::new(ROOT_INODE + 1),
             mount_point,
             ttl,
         };
-
-        // Initialize root directory mapping
-        fs.inode_map.insert(ROOT_INODE, PathBuf::from("/"));
-        fs.path_map.insert(PathBuf::from("/"), ROOT_INODE);
 
         info!("ImageFuseFS initialized successfully");
         Ok(fs)
     }
 
-    fn get_or_create_inode(&mut self, virtual_path: &Path) -> u64 {
-        if let Some(&inode) = self.path_map.get(virtual_path) {
-            return inode;
+    fn get_or_create_inode(&self, virtual_path: &Path) -> u64 {
+        if let Some(inode) = self.path_map.get(virtual_path) {
+            return *inode;
         }
 
-        let inode = self.next_inode;
-        self.next_inode += 1;
+        let inode = self.next_inode.fetch_add(1, Ordering::SeqCst);
 
         self.inode_map.insert(inode, virtual_path.to_path_buf());
         self.path_map.insert(virtual_path.to_path_buf(), inode);
@@ -83,8 +86,8 @@ impl ImageFuseFS {
         inode
     }
 
-    fn get_virtual_path(&self, inode: u64) -> Option<&PathBuf> {
-        self.inode_map.get(&inode)
+    fn get_virtual_path(&self, inode: u64) -> Option<PathBuf> {
+        self.inode_map.get(&inode).map(|r| r.clone())
     }
 
     fn get_real_path(&self, virtual_path: &Path) -> Option<PathBuf> {
@@ -168,7 +171,7 @@ impl ImageFuseFS {
         }
     }
 
-    fn list_directory(&mut self, virtual_dir: &Path) -> Vec<(String, u64, FileType)> {
+    fn list_directory(&self, virtual_dir: &Path) -> Vec<(String, u64, FileType)> {
         log::trace!("Listing directory: {virtual_dir:?}");
 
         let mut entries = Vec::new();
@@ -419,29 +422,12 @@ impl Filesystem for ImageFuseFS {
                 }
                 Err(e) => {
                     error!("Conversion failed for {real_path:?}: {e}");
-                    // Fallback to original file
-                    match std::fs::read(&real_path) {
-                        Ok(original_data) => {
-                            debug!("Using original file, {} bytes", original_data.len());
-                            if let Err(e) = self.cache.put_with_context(
-                                cache_key.clone(),
-                                original_data.clone(),
-                                &context,
-                            ) {
-                                warn!("Failed to cache original image: {e}");
-                            }
-                            original_data
-                        }
-                        Err(e) => {
-                            error!("Failed to read original file {real_path:?}: {e}");
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                    }
+                    reply.error(libc::EIO);
+                    return;
                 }
             }
         } else {
-            // Serve original file
+            // Non-convertible file - serve original
             match std::fs::read(&real_path) {
                 Ok(original_data) => {
                     if let Err(e) =
