@@ -137,18 +137,6 @@ impl ImageFuseFS {
         }
     }
 
-    fn estimate_converted_size(&self, real_path: &Path) -> u64 {
-        if let Ok(size) = image_converter::estimate_heic_size(real_path, &self.config.heic_settings)
-        {
-            size
-        } else {
-            // Fallback: assume 50% compression
-            std::fs::metadata(real_path)
-                .map(|m| m.len() / 2)
-                .unwrap_or(0)
-        }
-    }
-
     fn list_directory(&mut self, virtual_dir: &Path) -> Vec<(String, u64, FileType)> {
         log::trace!("Listing directory: {virtual_dir:?}");
 
@@ -291,15 +279,12 @@ impl Filesystem for ImageFuseFS {
                 original_size,
                 &self.config.heic_settings,
             );
+            // Use cached size if available, otherwise original size
+            // (kernel handles short reads at EOF fine)
             let size = if let Some(cached_data) = self.cache.get_with_context(&cache_key, &context)
             {
-                // Use cached converted size
                 cached_data.len() as u64
-            } else if image_converter::is_convertible_format(&real_path) {
-                // Use estimation for convertible files without cache
-                self.estimate_converted_size(&real_path)
             } else {
-                // Use original file size for non-convertible files
                 original_size
             };
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use image::{DynamicImage, GenericImageView};
+use image::DynamicImage;
 use libheif_rs::{
     Channel, ColorSpace, CompressionFormat, EncoderQuality, HeifContext, Image, LibHeif, RgbChroma,
 };
@@ -8,7 +8,6 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::HeicSettings;
-use crate::file_detector::ImageFormat;
 
 fn decode_heic_with_libheif(input_data: &[u8]) -> Result<DynamicImage> {
     let lib_heif = LibHeif::new();
@@ -197,56 +196,6 @@ pub fn convert_to_heic_blocking(
     Ok(output_data)
 }
 
-pub fn estimate_heic_size(original_path: &Path, heic_settings: &HeicSettings) -> Result<u64> {
-    // For estimation without actually converting, we can use heuristics
-    // based on image dimensions and quality settings
-
-    let metadata = fs::metadata(original_path)
-        .with_context(|| format!("Failed to get metadata for: {original_path:?}"))?;
-
-    let original_size = metadata.len();
-
-    // Read just enough to get image dimensions
-    let input_data = fs::read(original_path)
-        .with_context(|| format!("Failed to read input image: {original_path:?}"))?;
-
-    let img = image::load_from_memory(&input_data)
-        .with_context(|| format!("Failed to decode image: {original_path:?}"))?;
-
-    let (width, height) = img.dimensions();
-    let pixel_count = width as u64 * height as u64;
-
-    // Estimation based on quality and pixel count
-    // HEIC typically achieves 50-80% compression compared to JPEG
-    let quality_factor = heic_settings.quality as f64 / 100.0;
-    let base_compression = 0.3; // Base compression ratio for HEIC
-    let quality_adjusted_compression = base_compression + (quality_factor * 0.4);
-
-    // Additional estimation based on original format
-    let format_factor = if let Ok(Some(format)) = crate::file_detector::FileDetector::new(vec![])
-        .unwrap()
-        .detect_format(original_path)
-    {
-        match format {
-            ImageFormat::Png => 0.8,  // PNG is usually larger, so more compression
-            ImageFormat::Jpeg => 1.0, // JPEG baseline
-            ImageFormat::Gif => 0.9,  // GIF can vary
-            ImageFormat::Heic => 1.0, // Already HEIC
-            _ => 1.0,
-        }
-    } else {
-        1.0
-    };
-
-    let estimated_size =
-        (original_size as f64 * quality_adjusted_compression * format_factor) as u64;
-
-    // Ensure minimum reasonable size
-    let min_size = std::cmp::max(1024, pixel_count / 100); // At least 1KB or 1 byte per 100 pixels
-
-    Ok(std::cmp::max(estimated_size, min_size))
-}
-
 pub fn is_convertible_format(path: &Path) -> bool {
     if let Ok(detector) = crate::file_detector::FileDetector::new(vec![]) {
         if let Ok(Some(format)) = detector.detect_format(path) {
@@ -259,49 +208,9 @@ pub fn is_convertible_format(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{DynamicImage, ImageFormat as ImageCrateFormat};
-    use std::fs;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_estimate_heic_size() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let test_file = temp_dir.path().join("test.jpg");
-
-        // Create a realistic test image with random-ish data (less compressible)
-        let mut img = image::RgbImage::new(200, 200);
-        for (x, y, pixel) in img.enumerate_pixels_mut() {
-            // Create a pattern that's less compressible than solid colors
-            *pixel = image::Rgb([
-                ((x + y) % 256) as u8,
-                ((x * 2) % 256) as u8,
-                ((y * 2) % 256) as u8,
-            ]);
-        }
-        let dynamic_img = DynamicImage::ImageRgb8(img);
-        dynamic_img.save_with_format(&test_file, ImageCrateFormat::Jpeg)?;
-
-        let settings = HeicSettings {
-            quality: 50,
-            speed: 4,
-            chroma: 420,
-            max_resolution: None,
-        };
-
-        let estimated_size = estimate_heic_size(&test_file, &settings)?;
-        assert!(estimated_size > 0);
-
-        // For this test, just ensure the estimation is reasonable (not too large)
-        let original_size = fs::metadata(&test_file)?.len();
-        assert!(estimated_size < original_size * 2); // Should be within 2x of original
-
-        Ok(())
-    }
 
     #[test]
     fn test_is_convertible_format() {
-        // These tests would need actual image files to work properly
-        // For now, just test that the function doesn't panic
         let path = Path::new("test.jpg");
         let _ = is_convertible_format(path);
 
