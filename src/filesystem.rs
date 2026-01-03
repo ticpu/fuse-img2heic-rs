@@ -92,6 +92,11 @@ impl ImageFuseFS {
             .get_real_path(virtual_path, &self.config.source_paths)
     }
 
+    fn is_virtual_directory(&self, virtual_path: &Path) -> bool {
+        self.file_detector
+            .is_virtual_directory(virtual_path, &self.config.source_paths)
+    }
+
     fn preserve_original_timestamps(&self, attr: &mut FileAttr, real_path: &Path) {
         if let Ok(metadata) = std::fs::metadata(real_path) {
             if let Ok(mtime) = metadata.modified() {
@@ -246,9 +251,8 @@ impl Filesystem for ImageFuseFS {
             log::trace!("No real path found for virtual: {virtual_path:?}");
         }
 
-        // Check if it's a directory (directories can have dots in their names)
-        let entries = self.list_directory(&virtual_path);
-        if !entries.is_empty() {
+        // Check if it's a directory (even empty ones)
+        if self.is_virtual_directory(&virtual_path) {
             let inode = self.get_or_create_inode(&virtual_path);
             let mut attr = self.create_file_attr(0, true);
             attr.ino = inode;
@@ -309,9 +313,8 @@ impl Filesystem for ImageFuseFS {
             return;
         }
 
-        // Check if it's a directory
-        let entries = self.list_directory(&virtual_path);
-        if !entries.is_empty() {
+        // Check if it's a directory (even empty ones)
+        if self.is_virtual_directory(&virtual_path) {
             let mut attr = self.create_file_attr(0, true);
             attr.ino = ino;
             reply.attr(&self.ttl, &attr);

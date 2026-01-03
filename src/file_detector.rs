@@ -132,6 +132,30 @@ impl FileDetector {
         Ok(None)
     }
 
+    /// Check if a virtual path corresponds to a real directory
+    pub fn is_virtual_directory(&self, virtual_path: &Path, source_paths: &[SourcePath]) -> bool {
+        if virtual_path == Path::new("/") || virtual_path.as_os_str().is_empty() {
+            return true;
+        }
+
+        let Ok((mount_name, subpath)) = self.parse_virtual_path(virtual_path) else {
+            return false;
+        };
+
+        // Check if it's just a mount name (top-level directory)
+        if subpath.as_os_str().is_empty() {
+            return source_paths.iter().any(|sp| sp.mount_name == mount_name);
+        }
+
+        // Check if the real path exists and is a directory
+        let Some(source_path) = source_paths.iter().find(|sp| sp.mount_name == mount_name) else {
+            return false;
+        };
+
+        let real_path = source_path.path.join(subpath);
+        real_path.is_dir()
+    }
+
     /// List entries in a specific virtual directory with path exclusions (e.g., mount points)
     pub fn list_virtual_directory_with_exclusions(
         &self,
